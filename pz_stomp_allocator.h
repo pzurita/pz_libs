@@ -33,8 +33,6 @@
 //   * Memory underrun - Reading or writing off the beginning of an allocation.
 //   * Use after free - Reading or writing an allocation that was already freed.
 //
-// This allocator was written to help detect hard to find bugs. It was written
-// originally as an allocator for Unreal Engine 4.
 // USAGE
 // 
 // To use this allocator you must set the correct following defines based on
