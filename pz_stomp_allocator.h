@@ -71,6 +71,7 @@
 	#endif // !WIN32_LEAN_AND_MEAN
 
 	#include <windows.h> // Required for VirtualAlloc, VirtualFree, VirtualProtect.
+	#include <intrin.h> // Required for __debugbreak.
 
 	#if defined(PZ_REVERT_WIN32_LEAN_AND_MEAN)
 		#undef WIN32_LEAN_AND_MEAN
@@ -81,9 +82,9 @@
 		#define PZ_COMPILER_MSVC
 	#endif // _MSC_VER
 #elif defined(PZ_PLATFORM_LINUX) || defined(PZ_PLATFORM_MAC)
-	#include <sys/mman.h> // Required for VirtualAlloc, munmap, mprotect.
+	#include <sys/mman.h> // Required for mmap, munmap, mprotect.
 	#if defined(PZ_PLATFORM_LINUX)
-		#include <signal.h>
+		#include <signal.h> // Required for raise.
 	#endif // PZ_PLATFORM_LINUX
 #endif // PZ_PLATFORM_WINDOWS
 
@@ -91,6 +92,58 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+
+////////////////////////////////////////////////////////////////////////////////
+// Internal functions and structures. Shouldn't need to touch them unless you
+// are adding support for a new platform.
+
+static void *pz_internal_stomp_allocator_virtual_alloc(const size_t size)
+{
+#if defined(PZ_PLATFORM_LINUX) || defined(PZ_PLATFORM_MAC)
+	return mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, (off_t)0);
+#elif defined(PZ_PLATFORM_WINDOWS)
+	return VirtualAlloc(NULL, (SIZE_T)(size), (DWORD)MEM_COMMIT, (DWORD)PAGE_READWRITE);
+#else
+	#error pz_stomp_allocator does not support this platform.
+#endif // PZ_PLATFORM_LINUX || PZ_PLATFORM_MAC
+}
+
+static void pz_internal_stomp_allocator_virtual_free(void * const ptr, const size_t size)
+{
+#if defined(PZ_PLATFORM_LINUX) || defined(PZ_PLATFORM_MAC)
+	munmap(ptr, size);
+#elif defined(PZ_PLATFORM_WINDOWS)
+	size;
+	VirtualFree(ptr, (SIZE_T)0U, (DWORD)MEM_RELEASE);
+#else
+	#error pz_stomp_allocator does not support this platform.
+#endif // PZ_PLATFORM_LINUX || PZ_PLATFORM_MAC
+}
+
+static void pz_internal_stomp_allocator_virtual_protect(void * const ptr, const size_t size)
+{
+#if defined(PZ_PLATFORM_LINUX) || defined(PZ_PLATFORM_MAC)
+	mprotect(ptr, size, PROT_NONE);
+#elif defined(PZ_PLATFORM_WINDOWS)
+	DWORD flOldProtect;
+	VirtualProtect(ptr, (SIZE_T)size, (DWORD)PAGE_NOACCESS, &flOldProtect);
+#else
+	#error pz_stomp_allocator does not support this platform.
+#endif // PZ_PLATFORM_LINUX || PZ_PLATFORM_MAC
+}
+
+static void pz_internal_stomp_allocator_debug_break()
+{
+#if defined(PZ_PLATFORM_WINDOWS)
+	__debugbreak();
+#elif defined(PZ_PLATFORM_MAC)
+	__asm__("int $3");
+#elif defined(PZ_PLATFORM_LINUX)
+	raise(SIGTRAP);
+#else
+	#error pz_stomp_allocator does not support this platform.
+#endif // PZ_PLATFORM_WINDOWS
+}
 
 #if defined(PZ_PLATFORM_64BITS)
 /** Expected value to be found in the sentinel. */
@@ -102,10 +155,7 @@ static const size_t scSentinelExpectedValue = 0xdeadbeef;
 #error pz_stomp_allocator does not support this platform.
 #endif
 
-/** Size of each page. */
-static const size_t scPageSize = 4096U;
-
-struct pz_stomp_per_allocation_data
+struct pz_internal_stomp_allocator_per_allocation_data
 {
 	/** Pointer to the full allocation. Needed so the OS knows what to free. */
 	void	*mFullAllocationPointer;
@@ -116,6 +166,12 @@ struct pz_stomp_per_allocation_data
 	/** Sentinel used to check for underruns. */
 	size_t	mSentinel;
 };
+
+/** Size of each page. */
+static const size_t scPageSize = 4096U;
+
+////////////////////////////////////////////////////////////////////////////////
+// Public API.
 
 /**
  * Allocates a block of a given number of bytes of memory with the required
@@ -135,32 +191,26 @@ static void *pz_stomp_allocator_alloc(const size_t size, const uint32_t alignmen
 		return NULL;
 
 	const size_t alignedSize = (alignment > 0U) ? ((size + alignment - 1U) & -((int32_t)alignment)) : size;
-	const size_t allocFullPageSize = alignedSize + sizeof(struct pz_stomp_per_allocation_data) + (scPageSize - 1) & ~(scPageSize - 1U);
+	const size_t allocFullPageSize = alignedSize + sizeof(struct pz_internal_stomp_allocator_per_allocation_data) + (scPageSize - 1) & ~(scPageSize - 1U);
 
-#if defined(PZ_PLATFORM_LINUX) || defined(PZ_PLATFORM_MAC)
-	void * const fullAllocationPointer = mmap(NULL, allocFullPageSize + scPageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, (off_t)0);
-#elif defined(PZ_PLATFORM_WINDOWS)
-	void * const fullAllocationPointer = VirtualAlloc(NULL, (SIZE_T)(allocFullPageSize + scPageSize), (DWORD)MEM_COMMIT, (DWORD)PAGE_READWRITE);
-#else
-#error pz_stomp_allocator does not support this platform.
-#endif // PZ_PLATFORM_LINUX || PZ_PLATFORM_MAC
+	void * const fullAllocationPointer = pz_internal_stomp_allocator_virtual_alloc(allocFullPageSize + scPageSize);
 
 	void *returnedPointer = NULL;
-	static const size_t allocationDataSize = sizeof(struct pz_stomp_per_allocation_data);
+	static const size_t allocationDataSize = sizeof(struct pz_internal_stomp_allocator_per_allocation_data);
 
 #if defined(PZ_STOMP_DETECT_UNDERRUNS)
 	{
 		const size_t alignedAllocationData = (alignment > 0U) ? ((allocationDataSize + alignment - 1U) & -((int32_t)alignment)) : allocationDataSize;
 		returnedPointer = (void*)((uint8_t*)fullAllocationPointer + scPageSize + alignedAllocationData);
 
-		struct pz_stomp_per_allocation_data * const allocDataPtr = (struct pz_stomp_per_allocation_data*)((uint8_t*)fullAllocationPointer + scPageSize);
+		struct pz_internal_stomp_allocator_per_allocation_data * const allocDataPtr = (struct pz_internal_stomp_allocator_per_allocation_data*)((uint8_t*)fullAllocationPointer + scPageSize);
 #if defined(PZ_COMPILER_MSVC)
 		// "nonstandard extension used : non-constant aggregate initializer"
 		// This is valid C99.
 		#pragma warning(push)
 		#pragma warning(disable : 4204)
 #endif // PZ_COMPILER_MSVC
-		const struct pz_stomp_per_allocation_data allocData = { fullAllocationPointer, allocFullPageSize + scPageSize, alignedSize, scSentinelExpectedValue };
+		const struct pz_internal_stomp_allocator_per_allocation_data allocData = { fullAllocationPointer, allocFullPageSize + scPageSize, alignedSize, scSentinelExpectedValue };
 #if defined(PZ_COMPILER_MSVC)
 		#pragma warning(pop)
 #endif // PZ_COMPILER_MSVC
@@ -169,27 +219,20 @@ static void *pz_stomp_allocator_alloc(const size_t size, const uint32_t alignmen
 
 		// Page protect the first page, this will cause the exception in case
 		// there is an underrun.
-#if defined(PZ_PLATFORM_LINUX) || defined(PZ_PLATFORM_MAC)
-		mprotect(fullAllocationPointer, scPageSize, PROT_NONE);
-#elif defined(PZ_PLATFORM_WINDOWS)
-		DWORD flOldProtect;
-		VirtualProtect(fullAllocationPointer, (SIZE_T)scPageSize, (DWORD)PAGE_NOACCESS, &flOldProtect);
-#else
-#error pz_stomp_allocator does not support this platform.
-#endif // PZ_PLATFORM_LINUX || PZ_PLATFORM_MAC
+		pz_internal_stomp_allocator_virtual_protect(fullAllocationPointer, scPageSize);
 	}
 #else
 	{
 		returnedPointer = (void*)((uint8_t*)fullAllocationPointer + allocFullPageSize - alignedSize);
 
-		struct pz_stomp_per_allocation_data * const allocDataPtr = (struct pz_stomp_per_allocation_data*)((uint8_t*)returnedPointer - allocationDataSize);
+		struct pz_internal_stomp_allocator_per_allocation_data * const allocDataPtr = (struct pz_internal_stomp_allocator_per_allocation_data*)((uint8_t*)returnedPointer - allocationDataSize);
 #if defined(PZ_COMPILER_MSVC)
 		// "nonstandard extension used : non-constant aggregate initializer"
 		// This is valid C99.
 		#pragma warning(push)
 		#pragma warning(disable : 4204)
 #endif // PZ_COMPILER_MSVC
-		const struct pz_stomp_per_allocation_data allocData = { fullAllocationPointer, allocFullPageSize + scPageSize, alignedSize, scSentinelExpectedValue };
+		const struct pz_internal_stomp_allocator_per_allocation_data allocData = { fullAllocationPointer, allocFullPageSize + scPageSize, alignedSize, scSentinelExpectedValue };
 #if defined(PZ_COMPILER_MSVC)
 		#pragma warning(pop)
 #endif // PZ_COMPILER_MSVC
@@ -197,14 +240,7 @@ static void *pz_stomp_allocator_alloc(const size_t size, const uint32_t alignmen
 
 		// Page protect the last page, this will cause the exception in case
 		// there is an overrun.
-#if defined(PZ_PLATFORM_LINUX) || defined(PZ_PLATFORM_MAC)
-		mprotect((void*)((uint8_t*)(fullAllocationPointer)+allocFullPageSize), scPageSize, PROT_NONE);
-#elif defined(PZ_PLATFORM_WINDOWS)
-		DWORD flOldProtect;
-		VirtualProtect((void*)((uint8_t*)(fullAllocationPointer)+allocFullPageSize), (SIZE_T)scPageSize, (DWORD)PAGE_NOACCESS, &flOldProtect);
-#else
-#error pz_stomp_allocator does not support this platform.
-#endif // PZ_PLATFORM_LINUX || PZ_PLATFORM_MAC
+		pz_internal_stomp_allocator_virtual_protect((void*)((uint8_t*)(fullAllocationPointer)+allocFullPageSize), scPageSize);
 	}
 #endif // !PZ_STOMP_DETECT_UNDERRUNS
 
@@ -223,31 +259,17 @@ static void pz_stomp_allocator_free(const void * const ptr)
 		return;
 	}
 
-	const struct pz_stomp_per_allocation_data * allocDataPtr = (const struct pz_stomp_per_allocation_data *)ptr;
+	const struct pz_internal_stomp_allocator_per_allocation_data * allocDataPtr = (const struct pz_internal_stomp_allocator_per_allocation_data *)ptr;
 	allocDataPtr--;
 
 	// Check that our sentinel is intact.
 	if (allocDataPtr->mSentinel != scSentinelExpectedValue)
 	{
 		// There was a memory underrun related to this allocation.
-#if defined(PZ_PLATFORM_WINDOWS)
-		__debugbreak();
-#elif defined(PZ_PLATFORM_MAC)
-		__asm__("int $3");
-#elif defined(PZ_PLATFORM_LINUX)
-		raise(SIGTRAP);
-#else
-#error pz_stomp_allocator does not support this platform.
-#endif // PZ_PLATFORM_WINDOWS
+		pz_internal_stomp_allocator_debug_break();
 	}
 
-#if defined(PZ_PLATFORM_LINUX) || defined(PZ_PLATFORM_MAC)
-	munmap(allocDataPtr->mFullAllocationPointer, allocDataPtr->mFullSize);
-#elif defined(PZ_PLATFORM_WINDOWS)
-	VirtualFree(allocDataPtr->mFullAllocationPointer, (SIZE_T)0U, (DWORD)MEM_RELEASE);
-#else
-#error pz_stomp_allocator does not support this platform.
-#endif // PZ_PLATFORM_LINUX || PZ_PLATFORM_MAC
+	pz_internal_stomp_allocator_virtual_free(allocDataPtr->mFullAllocationPointer, allocDataPtr->mFullSize);
 }
 
 /**
@@ -270,11 +292,11 @@ static void* pz_stomp_allocator_realloc(const void * const ptr, const size_t new
 		return NULL;
 	}
 
-	void *returnPtr = pz_stomp_allocator_alloc(newSize, alignment);
+	void * const returnPtr = pz_stomp_allocator_alloc(newSize, alignment);
 
 	if (ptr != NULL)
 	{
-		const struct pz_stomp_per_allocation_data * const allocDataPtr = (const struct pz_stomp_per_allocation_data * const)((const uint8_t * const)(ptr)-sizeof(struct pz_stomp_per_allocation_data));
+		const struct pz_internal_stomp_allocator_per_allocation_data * const allocDataPtr = (const struct pz_internal_stomp_allocator_per_allocation_data * const)((const uint8_t * const)(ptr)-sizeof(struct pz_internal_stomp_allocator_per_allocation_data));
 		memcpy(returnPtr, ptr, (allocDataPtr->mSize < newSize) ? allocDataPtr->mSize : newSize);
 		pz_stomp_allocator_free(ptr);
 	}
