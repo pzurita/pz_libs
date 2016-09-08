@@ -35,9 +35,14 @@
 //
 // USAGE
 // 
+// The API contains just 3 functions:
+//   * pz_stomp_allocator_alloc() - Allocates memory with a given alignement.
+//   * pz_stomp_allocator_free() - Frees a memory allocation.
+//   * pz_stomp_allocator_alloc() - Changes the size of an allocation.
+// For more details see the comment on each function.
+//
 // To use this allocator you must set the correct following defines based on
 // your target build, platform, and expected behavior:
-//
 //   * PZ_STOMP_DETECT_UNDERRUNS - Detect underruns instead of overruns.
 //   * PZ_PLATFORM_32BITS - 32-bit builds.
 //   * PZ_PLATFORM_64BITS - 64-bit builds.
